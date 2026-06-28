@@ -26,7 +26,7 @@ def is_probably_text_file(path: Path, sample_size: int = 4096) -> bool:
     if not sample:
         return False
 
-    if b"\x00" in sample:
+    if b"\x00" in sample: # Null bytes are common in binary files, so this helps avoid reading images/zips as text.
         return False
     
     try:
@@ -60,7 +60,7 @@ def get_content_hash(path: Path) -> str:
 
     with path.open("rb") as file:
         while True:
-            chunk = file.read(1024 * 1024)
+            chunk = file.read(1024 * 1024) # Read in chunks so large files do not need to be loaded fully into memory.
             
             if chunk == b"":
                 break

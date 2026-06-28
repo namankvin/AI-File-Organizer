@@ -14,5 +14,8 @@ class FileRecord(Base):
     modified_at = Column(DateTime, nullable = False)
     content_hash = Column(String, nullable = True, index = True)
     text_preview = Column(Text, nullable = True)
+    embedding = Column(Text, nullable=True)
+    embedding_model = Column(String, nullable=True)
+    embedding_updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default = func.now(), nullable = False)
     updated_at = Column(DateTime, server_default = func.now(), onupdate = func.now(), nullable = False)
