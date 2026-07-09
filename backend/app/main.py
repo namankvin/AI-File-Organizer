@@ -6,8 +6,9 @@ from app import models
 from app.config import APP_NAME, DATABASE_URL
 from app.database import Base, engine, SessionLocal
 from app.scanner import scan_folder
-from app.models import FileRecord
+from app.models import FileRecord, MoveSuggestion
 from app.embeddings import EMBEDDING_MODEL_NAME, build_embedding_text, generate_embedding, serialize_embedding, deserialize_embedding, cosine_similarity
+from app.planner import create_move_plan_for_file
 
 app = FastAPI(title = APP_NAME)
 
@@ -193,6 +194,67 @@ def rag_answer(query: str, limit: int = 3, min_score: float = 0.25):
             "query": query,
             "answer": answer,
             "relevant_files": top_results
+        }
+    finally:
+        db.close()
+
+@app.post("/plan")
+def create_plan(query: str | None = None, target_folder: str | None = None, limit: int = 10, min_score: float = 0.50):
+    db = SessionLocal()
+    try:
+        # Rebuild the current pending plan so the preview reflects the latest scan.
+        db.query(MoveSuggestion).filter(MoveSuggestion.status == "pending").delete()
+
+        if query and target_folder:
+            # Command mode plans moves into a user-provided target folder, but does not move files yet.
+            search_results = get_semantic_search_results(db, query, limit)
+            suggestions = []
+
+            for result in search_results:
+                if result["score"] < min_score:
+                    continue
+                source_path = result["path"]
+                file_name = Path(source_path).name
+                target_path = str(Path(target_folder) / file_name)
+
+                suggestion_data = {
+                    "file_id": result["id"],
+                    "source_path": source_path,
+                    "target_path": target_path,
+                    "category": Path(target_folder).name,
+                    "confidence": result["score"],
+                    "reason": f"Matched command query '{query}' using semantic similarity",
+                }
+
+                suggestions.append(suggestion_data)
+                suggestion = MoveSuggestion(**suggestion_data)
+                db.add(suggestion)
+
+            db.commit()
+
+            return {
+                "mode" : "command",
+                "query" : query,
+                "target_folder" : target_folder,
+                "suggestion_count" : len(suggestions),
+                "suggestions" : suggestions
+            }
+
+        files = db.query(FileRecord).all()
+        suggestions = []
+
+        for file in files:
+            suggestion_data = create_move_plan_for_file(file)
+            suggestions.append(suggestion_data)
+            suggestion = MoveSuggestion(**suggestion_data)
+            db.add(suggestion)
+        
+        db.commit()
+        
+        return {
+            "mode": "auto",
+            "suggestion_count": len(suggestions),
+            "suggestions": suggestions
         }
     finally:
         db.close()

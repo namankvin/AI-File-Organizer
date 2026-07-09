@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, Integer, String, Text
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.sql import func
 
 from app.database import Base
@@ -19,3 +19,17 @@ class FileRecord(Base):
     embedding_updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default = func.now(), nullable = False)
     updated_at = Column(DateTime, server_default = func.now(), onupdate = func.now(), nullable = False)
+
+class MoveSuggestion(Base):
+    __tablename__ = "move_suggestions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_id = Column(Integer, nullable=False, index=True)
+    source_path = Column(String, nullable=False)
+    target_path = Column(String, nullable=False)
+    category = Column(String, nullable=False, index=True)
+    confidence = Column(Float, nullable=False)
+    reason = Column(Text, nullable=False)
+    # Suggestions start as pending and will be applied or dismissed later.
+    status = Column(String, nullable=False, index=True, default="pending")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
