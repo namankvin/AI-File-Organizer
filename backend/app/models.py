@@ -20,7 +20,7 @@ class FileRecord(Base):
     created_at = Column(DateTime, server_default = func.now(), nullable = False)
     updated_at = Column(DateTime, server_default = func.now(), onupdate = func.now(), nullable = False)
 
-class MoveSuggestion(Base):
+class MoveSuggestion(Base): # Proposed action
     __tablename__ = "move_suggestions"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -33,3 +33,16 @@ class MoveSuggestion(Base):
     # Suggestions start as pending and will be applied or dismissed later.
     status = Column(String, nullable=False, index=True, default="pending")
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+class FileOperation(Base): # Action that actually happened + Stores applied moves so they can be undone later.
+    __tablename__ = "file_operations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    suggestion_id = Column(Integer, nullable=False, index=True)
+    file_id = Column(Integer, nullable=False, index=True)
+    original_path = Column(String, nullable=False)
+    new_path = Column(String, nullable=False)
+    operation_type = Column(String, nullable=False, default="move")
+    status = Column(String, nullable=False, index=True, default="applied")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    undone_at = Column(DateTime, nullable=True)

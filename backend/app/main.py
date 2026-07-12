@@ -6,9 +6,11 @@ from app import models
 from app.config import APP_NAME, DATABASE_URL
 from app.database import Base, engine, SessionLocal
 from app.scanner import scan_folder
-from app.models import FileRecord, MoveSuggestion
+from app.models import FileRecord, MoveSuggestion, FileOperation
 from app.embeddings import EMBEDDING_MODEL_NAME, build_embedding_text, generate_embedding, serialize_embedding, deserialize_embedding, cosine_similarity
 from app.planner import create_move_plan_for_file
+from app.schemas import ApplyRequest
+from app.file_actions import move_file
 
 app = FastAPI(title = APP_NAME)
 
@@ -44,12 +46,18 @@ def scan(folder_path: str):
             existing_file = db.query(FileRecord).filter(FileRecord.path == file_data["path"]).first()
 
             if existing_file:
+                content_changed = existing_file.content_hash != file_data["content_hash"]
                 existing_file.name = file_data["name"]
                 existing_file.extension = file_data["extension"]
                 existing_file.size_bytes = file_data["size_bytes"]
                 existing_file.modified_at = file_data["modified_at"]
                 existing_file.content_hash = file_data["content_hash"]
                 existing_file.text_preview = file_data["text_preview"]
+                if content_changed:
+                    # A vector generated from old content is no longer trustworthy.
+                    existing_file.embedding = None
+                    existing_file.embedding_model = None
+                    existing_file.embedding_updated_at = None
                 updated_count += 1
             else:
                 file_record = FileRecord(**file_data)
@@ -256,5 +264,231 @@ def create_plan(query: str | None = None, target_folder: str | None = None, limi
             "suggestion_count": len(suggestions),
             "suggestions": suggestions
         }
+    finally:
+        db.close()
+
+
+@app.post("/apply")
+def apply_suggestions(request: ApplyRequest):
+    db = SessionLocal()
+    completed_file_moves = []
+
+    try:
+        suggestions = (
+            db.query(MoveSuggestion)
+            .filter(
+                MoveSuggestion.id.in_(request.suggestion_ids),
+                MoveSuggestion.status == "pending"
+            )
+            .all()
+        )
+
+        found_ids = {
+            suggestion.id for suggestion in suggestions
+        }
+
+        missing_ids = [
+            suggestion_id
+            for suggestion_id in request.suggestion_ids
+            if suggestion_id not in found_ids
+        ]
+
+        if missing_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Pending suggestions not found: {missing_ids}"
+            )
+
+        files_by_id = {}
+
+        for suggestion in suggestions:
+            file_record = (
+                db.query(FileRecord)
+                .filter(FileRecord.id == suggestion.file_id)
+                .first()
+            )
+
+            if file_record is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"File record {suggestion.file_id} not found"
+                )
+
+            files_by_id[suggestion.file_id] = file_record
+
+        applied_moves = []
+
+        for suggestion in suggestions:
+            file_record = files_by_id[suggestion.file_id]
+            original_path = suggestion.source_path
+
+            final_path = move_file(
+                suggestion.source_path,
+                suggestion.target_path
+            )
+            completed_file_moves.append((final_path, original_path))
+
+            operation = FileOperation(
+                suggestion_id=suggestion.id,
+                file_id=suggestion.file_id,
+                original_path=original_path,
+                new_path=final_path
+            )
+
+            db.add(operation)
+
+            suggestion.status = "applied"
+
+            file_record.path = final_path
+            file_record.name = Path(final_path).name
+
+            applied_moves.append(
+                {
+                    "suggestion_id": suggestion.id,
+                    "file_id": suggestion.file_id,
+                    "original_path": original_path,
+                    "new_path": final_path,
+                }
+            )
+
+        db.commit()
+
+        return {
+            "applied_count": len(applied_moves),
+            "moves": applied_moves
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except (FileNotFoundError, ValueError) as error:
+        db.rollback()
+        # If a later move fails, put earlier files back so disk and DB agree.
+        for current_path, original_path in reversed(completed_file_moves):
+            if Path(current_path).exists() and not Path(original_path).exists():
+                move_file(current_path, original_path)
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception:
+        db.rollback()
+        for current_path, original_path in reversed(completed_file_moves):
+            if Path(current_path).exists() and not Path(original_path).exists():
+                move_file(current_path, original_path)
+        raise
+    finally:
+        db.close()
+
+
+@app.get("/suggestions")
+def get_suggestions(status: str | None = None):
+    db = SessionLocal()
+    try:
+        query = db.query(MoveSuggestion)
+        if status is not None:
+            query = query.filter(MoveSuggestion.status == status)
+
+        suggestions = query.order_by(MoveSuggestion.created_at.desc()).all()
+        return {
+            "count": len(suggestions),
+            "suggestions": [
+                {
+                    "id": suggestion.id,
+                    "file_id": suggestion.file_id,
+                    "source_path": suggestion.source_path,
+                    "target_path": suggestion.target_path,
+                    "category": suggestion.category,
+                    "confidence": suggestion.confidence,
+                    "reason": suggestion.reason,
+                    "status": suggestion.status,
+                    "created_at": suggestion.created_at,
+                }
+                for suggestion in suggestions
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.get("/operations")
+def get_operations():
+    db = SessionLocal()
+    try:
+        operations = db.query(FileOperation).order_by(FileOperation.created_at.desc()).all()
+        return {
+            "count": len(operations),
+            "operations": [
+                {
+                    "id": operation.id,
+                    "suggestion_id": operation.suggestion_id,
+                    "file_id": operation.file_id,
+                    "original_path": operation.original_path,
+                    "new_path": operation.new_path,
+                    "operation_type": operation.operation_type,
+                    "status": operation.status,
+                    "created_at": operation.created_at,
+                    "undone_at": operation.undone_at,
+                }
+                for operation in operations
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.post("/undo/{operation_id}")
+def undo_operation(operation_id: int):
+    db = SessionLocal()
+    restored_path = None
+    operation = None
+
+    try:
+        operation = db.query(FileOperation).filter(FileOperation.id == operation_id).first()
+        if operation is None:
+            raise HTTPException(status_code=404, detail="Operation not found")
+        if operation.status != "applied":
+            raise HTTPException(status_code=409, detail="Operation has already been undone")
+
+        file_record = db.query(FileRecord).filter(FileRecord.id == operation.file_id).first()
+        if file_record is None:
+            raise HTTPException(status_code=404, detail="File record not found")
+        if Path(operation.original_path).exists():
+            raise HTTPException(
+                status_code=409,
+                detail="Original path is occupied; undo would overwrite an existing file",
+            )
+
+        restored_path = move_file(operation.new_path, operation.original_path)
+
+        file_record.path = restored_path
+        file_record.name = Path(restored_path).name
+        operation.status = "undone"
+        operation.undone_at = datetime.now()
+
+        suggestion = db.query(MoveSuggestion).filter(MoveSuggestion.id == operation.suggestion_id).first()
+        if suggestion is not None:
+            suggestion.status = "undone"
+
+        db.commit()
+        return {
+            "operation_id": operation.id,
+            "status": operation.status,
+            "restored_path": restored_path,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except (FileNotFoundError, ValueError) as error:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception:
+        db.rollback()
+        if (
+            restored_path
+            and operation is not None
+            and Path(restored_path).exists()
+            and not Path(operation.new_path).exists()
+        ):
+            move_file(restored_path, operation.new_path)
+        raise
     finally:
         db.close()
